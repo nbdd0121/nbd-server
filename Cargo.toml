@@ -1,0 +1,13 @@
+[package]
+name = "nbd-server"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+byteorder = "1.4"
+anyhow = "1.0"
+bitflags = "2"
+log = "0.4"
+env_logger = "0.10"
+io = { git = "https://github.com/nbdd0121/r2vm.git", default-features = false, features = ["block-file"] }
