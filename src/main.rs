@@ -3,9 +3,10 @@ mod server;
 use anyhow::Result;
 use clap::Parser;
 use io::block::Block;
-use std::fs::OpenOptions;
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::{fs::OpenOptions, pin::Pin};
+use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -34,15 +35,20 @@ struct Property {
     rotational: bool,
 }
 
-fn handle_client<B: Block>(stream: TcpStream, property: &Property, block: &mut B) -> Result<()> {
-    let mut rx = std::io::BufReader::new(&stream);
-    let mut tx = std::io::BufWriter::new(&stream);
-    server::handshake(&mut rx, &mut tx, property, block)?;
-    server::transmission(&mut rx, &mut tx, block)?;
+async fn handle_client<B>(mut stream: TcpStream, property: &Property, block: Arc<B>) -> Result<()>
+where
+    B: Block + Send + Sync + 'static,
+{
+    let (rx, tx) = stream.split();
+    let mut rx = tokio::io::BufReader::new(rx);
+    let mut tx = tokio::io::BufWriter::new(tx);
+    server::handshake(Pin::new(&mut rx), Pin::new(&mut tx), property, &*block).await?;
+    server::transmission(Pin::new(&mut rx), Pin::new(&mut tx), block).await?;
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     let opt = Opt::parse();
@@ -55,17 +61,17 @@ fn main() -> Result<()> {
     }
 
     let file = open_opt.open(opt.file)?;
-    let mut blk = io::block::File::new(file)?;
+    let blk = Arc::new(io::block::File::new(file)?);
 
     let size = blk.len();
     log::info!("Size of disk {size}");
 
-    let listener = TcpListener::bind((&*opt.addr, opt.port))?;
+    let listener = TcpListener::bind((&*opt.addr, opt.port)).await?;
 
     log::info!("Listening on {}:{}", opt.addr, opt.port);
 
     loop {
-        let (stream, addr) = listener.accept()?;
+        let (stream, addr) = listener.accept().await?;
         log::info!("Connection accepted from {addr}");
 
         match handle_client(
@@ -74,8 +80,10 @@ fn main() -> Result<()> {
                 readonly: opt.readonly,
                 rotational: opt.rotational,
             },
-            &mut blk,
-        ) {
+            blk.clone(),
+        )
+        .await
+        {
             Ok(_) => {
                 log::info!("client {addr} exited");
             }

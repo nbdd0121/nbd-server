@@ -2,10 +2,13 @@
 
 use super::Property;
 use anyhow::{bail, Result};
-use byteorder::{BigEndian as BE, ReadBytesExt, WriteBytesExt};
 use io::block::Block;
-use std::io::{Error, ErrorKind, Read, Write};
+use std::io::{Error, ErrorKind};
 use std::num::NonZeroU32;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub const NBD_REP_ACK: u32 = 1;
 pub const NBD_REP_SERVER: u32 = 2;
@@ -138,49 +141,57 @@ impl CommandError {
     pub const Shutdown: Self = Self(unsafe { NonZeroU32::new_unchecked(108) });
 }
 
-fn option_reply<TX: Write>(tx: &mut TX, option: Options, ty: u32, data: &[u8]) -> Result<()> {
-    tx.write_u64::<BE>(NBG_REPLY_MAGIC)?;
-    tx.write_u32::<BE>(option.0)?;
-    tx.write_u32::<BE>(ty)?;
-    tx.write_u32::<BE>(data.len() as u32)?;
-    tx.write_all(data)?;
-    tx.flush()?;
+async fn option_reply<TX: AsyncWrite>(
+    mut tx: Pin<&mut TX>,
+    option: Options,
+    ty: u32,
+    data: &[u8],
+) -> Result<()> {
+    tx.write_u64(NBG_REPLY_MAGIC).await?;
+    tx.write_u32(option.0).await?;
+    tx.write_u32(ty).await?;
+    tx.write_u32(data.len() as u32).await?;
+    tx.write_all(data).await?;
+    tx.flush().await?;
     Ok(())
 }
 
-fn option_reply_error<TX: Write>(
-    tx: &mut TX,
+async fn option_reply_error<TX: AsyncWrite>(
+    tx: Pin<&mut TX>,
     option: Options,
     error: OptionError,
     message: std::fmt::Arguments<'_>,
 ) -> Result<()> {
     log::warn!("{}", message);
     match message.as_str() {
-        Some(v) => option_reply(tx, option, error.0 | (1 << 31), v.as_bytes()),
-        None => option_reply(
-            tx,
-            option,
-            error.0 | (1 << 31),
-            message.to_string().as_bytes(),
-        ),
+        Some(v) => option_reply(tx, option, error.0 | (1 << 31), v.as_bytes()).await,
+        None => {
+            option_reply(
+                tx,
+                option,
+                error.0 | (1 << 31),
+                message.to_string().as_bytes(),
+            )
+            .await
+        }
     }
 }
 
-pub(crate) fn handshake<RX: Read, TX: Write, B: Block>(
-    rx: &mut RX,
-    tx: &mut TX,
+pub(crate) async fn handshake<RX: AsyncRead, TX: AsyncWrite, B: Block>(
+    mut rx: Pin<&mut RX>,
+    mut tx: Pin<&mut TX>,
     property: &Property,
-    block: &mut B,
+    block: &B,
 ) -> Result<()> {
     let mut buffer = vec![0u8; 1024 * 1024];
 
     let handshake_flags = HandshakeFlags::FIXED_NEWSTYLE | HandshakeFlags::NO_ZEROES;
-    tx.write_all(b"NBDMAGIC")?;
-    tx.write_u64::<BE>(NBD_IHAVEOPT)?;
-    tx.write_u16::<BE>(handshake_flags.bits())?;
-    tx.flush()?;
+    tx.write_all(b"NBDMAGIC").await?;
+    tx.write_u64(NBD_IHAVEOPT).await?;
+    tx.write_u16(handshake_flags.bits()).await?;
+    tx.flush().await?;
 
-    let client_flags = ClientFlags::from_bits_retain(rx.read_u32::<BE>()?);
+    let client_flags = ClientFlags::from_bits_retain(rx.read_u32().await?);
 
     if !client_flags.difference(ClientFlags::all()).is_empty() {
         bail!("Unrecognized client flags {:?}", client_flags);
@@ -191,44 +202,46 @@ pub(crate) fn handshake<RX: Read, TX: Write, B: Block>(
     }
 
     loop {
-        let magic = rx.read_u64::<BE>()?;
+        let magic = rx.read_u64().await?;
         if magic != NBD_IHAVEOPT {
             bail!("Unexpected magic {:x}, expecting IHAVEOPT", magic);
         }
 
-        let option = Options(rx.read_u32::<BE>()?);
-        let length = rx.read_u32::<BE>()? as usize;
+        let option = Options(rx.read_u32().await?);
+        let length = rx.read_u32().await? as usize;
 
         if length > buffer.len() {
             bail!("Option length {} is too big", length);
         }
 
         let buffer = &mut buffer[..length];
-        rx.read_exact(buffer)?;
+        rx.read_exact(buffer).await?;
 
         match option {
             Options::ExportName => {
                 let Ok(name) = std::str::from_utf8(buffer) else {
                     option_reply_error(
-                        tx,
+                        tx.as_mut(),
                         option,
                         OptionError::Invalid,
                         format_args!("export name must be UTF-8"),
-                    )?;
+                    )
+                    .await?;
                     continue;
                 };
 
                 if name != "rust" && !name.is_empty() {
                     option_reply_error(
-                        tx,
+                        tx.as_mut(),
                         option,
                         OptionError::Invalid,
                         format_args!("export name does not exist"),
-                    )?;
+                    )
+                    .await?;
                     continue;
                 }
 
-                tx.write_u64::<BE>(block.len())?;
+                tx.write_u64(block.len()).await?;
                 let mut flags = TransmissionFlags::HAS_FLAGS;
                 if property.readonly {
                     flags |= TransmissionFlags::READ_ONLY;
@@ -242,93 +255,104 @@ pub(crate) fn handshake<RX: Read, TX: Write, B: Block>(
                 if block.capability().discard {
                     flags |= TransmissionFlags::SEND_TRIM;
                 };
-                tx.write_u16::<BE>(flags.bits())?;
+                tx.write_u16(flags.bits()).await?;
                 if !client_flags.contains(ClientFlags::NO_ZEROES) {
-                    tx.write_all(&[0; 124])?;
+                    tx.write_all(&[0; 124]).await?;
                 }
-                tx.flush()?;
+                tx.flush().await?;
                 return Ok(());
             }
             Options::Abort => {
-                option_reply(tx, option, NBD_REP_ACK, &[])?;
+                option_reply(tx.as_mut(), option, NBD_REP_ACK, &[]).await?;
                 bail!("Client aborted connection");
             }
             Options::List => {
                 if length != 0 {
                     log::warn!("LIST comes with data");
                     option_reply_error(
-                        tx,
+                        tx.as_mut(),
                         option,
                         OptionError::Invalid,
                         format_args!("LIST comes with data"),
-                    )?;
+                    )
+                    .await?;
                     continue;
                 }
 
-                option_reply(tx, option, NBD_REP_SERVER, b"\x00\x00\x00\x04rust")?;
-                option_reply(tx, option, NBD_REP_ACK, &[])?;
+                option_reply(tx.as_mut(), option, NBD_REP_SERVER, b"\x00\x00\x00\x04rust").await?;
+                option_reply(tx.as_mut(), option, NBD_REP_ACK, &[]).await?;
             }
             Options::Starttls => {
                 option_reply_error(
-                    tx,
+                    tx.as_mut(),
                     option,
                     OptionError::Unsup,
                     format_args!("STARTTLS not supported"),
-                )?;
+                )
+                .await?;
             }
             Options::Info => {
                 // TODO!
                 option_reply_error(
-                    tx,
+                    tx.as_mut(),
                     option,
                     OptionError::Unsup,
                     format_args!("INFO not supported"),
-                )?;
+                )
+                .await?;
             }
             Options::Go => {
                 // TODO!
                 option_reply_error(
-                    tx,
+                    tx.as_mut(),
                     option,
                     OptionError::Unsup,
                     format_args!("GO not supported"),
-                )?;
+                )
+                .await?;
             }
             Options::StructuredReply => {
                 option_reply_error(
-                    tx,
+                    tx.as_mut(),
                     option,
                     OptionError::Unsup,
                     format_args!("STRUCTURED_REPLY not supported"),
-                )?;
+                )
+                .await?;
             }
             _ => {
                 option_reply_error(
-                    tx,
+                    tx.as_mut(),
                     option,
                     OptionError::Unsup,
                     format_args!("unrecognized option type {:x?}", option),
-                )?;
+                )
+                .await?;
             }
         }
     }
 }
 
-fn command_reply<TX: Write>(
-    tx: &mut TX,
+async fn command_reply<TX: AsyncWrite>(
+    mut tx: Pin<&mut TX>,
     error: Result<(), CommandError>,
     cookie: u64,
 ) -> Result<()> {
-    tx.write_u32::<BE>(NBD_SIMPLE_REPLY_MAGIC)?;
-    tx.write_u32::<BE>(match error {
+    tx.write_u32(NBD_SIMPLE_REPLY_MAGIC).await?;
+    tx.write_u32(match error {
         Ok(()) => 0,
         Err(err) => err.0.get(),
-    })?;
-    tx.write_u64::<BE>(cookie)?;
+    })
+    .await?;
+    tx.write_u64(cookie).await?;
     Ok(())
 }
 
-fn command_reply_error<TX: Write>(tx: &mut TX, error: Error, handle: u64) -> Result<()> {
+async fn command_reply_error<TX: AsyncWrite>(
+    mut tx: Pin<&mut TX>,
+    error: Error,
+    handle: u64,
+) -> Result<()> {
     log::error!("error processing command: {error}");
 
     let mut code = Ok(());
@@ -351,111 +375,135 @@ fn command_reply_error<TX: Write>(tx: &mut TX, error: Error, handle: u64) -> Res
         });
     }
 
-    command_reply(tx, code, handle)?;
-    tx.flush()?;
+    command_reply(tx.as_mut(), code, handle).await?;
+    tx.flush().await?;
     Ok(())
 }
 
-pub fn transmission<RX: Read, TX: Write, B: Block>(
-    rx: &mut RX,
-    tx: &mut TX,
-    block: &mut B,
-) -> Result<()> {
-    let mut buffer = vec![0u8; 1024 * 1024];
-    'outer: loop {
-        let magic = rx.read_u32::<BE>()?;
+pub async fn transmission<RX, TX, B>(
+    rx: Pin<&mut RX>,
+    tx: Pin<&mut TX>,
+    block: Arc<B>,
+) -> Result<()>
+where
+    RX: AsyncRead,
+    TX: AsyncWrite,
+    B: Block + Send + Sync + 'static,
+{
+    let (sender, recv) = tokio::sync::mpsc::unbounded_channel();
+    tokio::try_join! {
+        transmission_request(rx, sender, block.clone()),
+        transmission_reply(tx, recv),
+    }?;
+    Ok(())
+}
+
+pub async fn transmission_reply<TX>(
+    mut tx: Pin<&mut TX>,
+    mut replies: UnboundedReceiver<(u64, std::io::Result<Vec<u8>>)>,
+) -> Result<()>
+where
+    TX: AsyncWrite,
+{
+    while let Some((cookie, reply)) = replies.recv().await {
+        match reply {
+            Ok(data) => {
+                command_reply(tx.as_mut(), Ok(()), cookie).await?;
+                tx.write_all(&data).await?;
+                tx.flush().await?;
+            }
+            Err(err) => {
+                command_reply_error(tx.as_mut(), err, cookie).await?;
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn transmission_request<RX: AsyncRead, B>(
+    mut rx: Pin<&mut RX>,
+    replies: UnboundedSender<(u64, std::io::Result<Vec<u8>>)>,
+    block: Arc<B>,
+) -> Result<()>
+where
+    B: Block + Send + Sync + 'static,
+{
+    loop {
+        // Get a reference to the block device to be passed into sync code.
+        let block = block.clone();
+        let replies = replies.clone();
+
+        let magic = rx.read_u32().await?;
         if magic != NBD_REQUEST_MAGIC {
             bail!("Unexpected magic {:x}, expecting REQUEST_MAGIC", magic);
         }
 
-        let _flags = CommandFlags::from_bits_retain(rx.read_u16::<BE>()?);
-        let ty = Command(rx.read_u16::<BE>()?);
-        let cookie = rx.read_u64::<BE>()?;
-        let mut offset = rx.read_u64::<BE>()?;
-        let mut length = rx.read_u32::<BE>()? as usize;
+        let _flags = CommandFlags::from_bits_retain(rx.read_u16().await?);
+        let ty = Command(rx.read_u16().await?);
+        let cookie = rx.read_u64().await?;
+        let offset = rx.read_u64().await?;
+        let length = rx.read_u32().await? as usize;
 
         log::trace!("ty={ty:?}, cookie={cookie:x}, offset={offset:#x}, length={length:#x}");
 
         match ty {
             Command::Read => {
-                let mut first = true;
-                while length > 0 {
-                    let len = std::cmp::min(length, buffer.len());
-                    if let Err(err) = block.read_exact_at(&mut buffer[..len], offset) {
-                        if first {
-                            command_reply_error(tx, err, cookie)?;
-                            continue 'outer;
-                        }
-
-                        // We have already replied that this is successful,
-                        // so the only way is to terminate the connection
-                        log::error!("error processing READ, aborting: {err}");
-                        Err(err)?;
-                    };
-
-                    if first {
-                        command_reply(tx, Ok(()), cookie)?;
-                        first = false;
+                tokio::task::spawn_blocking(move || {
+                    let mut buffer = Vec::with_capacity(length);
+                    unsafe {
+                        buffer.set_len(length);
                     }
-                    tx.write_all(&buffer[..len])?;
-                    offset += len as u64;
-                    length -= len;
-                }
+                    let res = block.read_exact_at(&mut buffer, offset).map(|_| buffer);
+                    let _ = replies.send((cookie, res));
+                });
             }
             Command::Write => {
-                while length > 0 {
-                    let len = length.min(buffer.len());
-                    rx.read_exact(&mut buffer[..len])?;
-
-                    if let Err(err) = block.write_all_at(&buffer[..len], offset) {
-                        command_reply_error(tx, err, cookie)?;
-                        continue 'outer;
-                    };
-                    offset += len as u64;
-                    length -= len;
+                let mut buffer = Vec::with_capacity(length);
+                unsafe {
+                    buffer.set_len(length);
                 }
+                rx.read_exact(&mut buffer).await?;
 
-                command_reply(tx, Ok(()), cookie)?;
+                tokio::task::spawn_blocking(move || {
+                    let res = block.write_all_at(&buffer, offset).map(|_| Vec::new());
+                    let _ = replies.send((cookie, res));
+                });
             }
             Command::Disc => {
                 return Ok(());
             }
             Command::Flush => {
-                if let Err(err) = block.flush() {
-                    command_reply_error(tx, err, cookie)?;
-                    continue;
-                }
-                command_reply(tx, Ok(()), cookie)?;
+                tokio::task::spawn_blocking(move || {
+                    let res = block.flush().map(|_| Vec::new());
+                    let _ = replies.send((cookie, res));
+                });
             }
             Command::Trim => {
-                if let Err(err) = block.discard(offset, length) {
-                    command_reply_error(tx, err, cookie)?;
-                    continue;
-                }
-                command_reply(tx, Ok(()), cookie)?;
+                tokio::task::spawn_blocking(move || {
+                    let res = block.discard(offset, length).map(|_| Vec::new());
+                    let _ = replies.send((cookie, res));
+                });
             }
             Command::Cache => {
-                command_reply(tx, Ok(()), cookie)?;
+                replies.send((cookie, Ok(Vec::new())))?;
             }
             Command::WriteZeroes => {
-                if let Err(err) = block.write_zero_at(offset, length) {
-                    command_reply_error(tx, err, cookie)?;
-                    continue;
-                }
-                command_reply(tx, Ok(()), cookie)?;
+                tokio::task::spawn_blocking(move || {
+                    let res = block.write_zero_at(offset, length).map(|_| Vec::new());
+                    let _ = replies.send((cookie, res));
+                });
             }
             _ => {
-                command_reply_error(
-                    tx,
-                    Error::new(
+                replies.send((
+                    cookie,
+                    Err(Error::new(
                         ErrorKind::Unsupported,
                         format!("unrecognized command {ty:?}"),
-                    ),
-                    cookie,
-                )?;
-                continue;
+                    )),
+                ))?;
             }
         }
-        tx.flush()?;
     }
 }
