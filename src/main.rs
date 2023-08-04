@@ -1,3 +1,4 @@
+mod block;
 mod server;
 
 use anyhow::Result;
@@ -26,8 +27,21 @@ struct Opt {
     #[arg(long)]
     rotational: bool,
 
-    /// File or device to serve.
-    file: PathBuf,
+    #[command(subcommand)]
+    backend: Backend,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Backend {
+    File {
+        /// File or device to serve.
+        file: PathBuf,
+    },
+    Memory {
+        /// Size of the block device (in MiB).
+        #[arg(long)]
+        size: usize,
+    },
 }
 
 struct Property {
@@ -37,7 +51,7 @@ struct Property {
 
 async fn handle_client<B>(mut stream: TcpStream, property: &Property, block: Arc<B>) -> Result<()>
 where
-    B: Block + Send + Sync + 'static,
+    B: ?Sized + Block + Send + Sync + 'static,
 {
     let (rx, tx) = stream.split();
     let mut rx = tokio::io::BufReader::new(rx);
@@ -53,15 +67,20 @@ async fn main() -> Result<()> {
 
     let opt = Opt::parse();
 
-    let mut open_opt = OpenOptions::new();
-    open_opt.read(true);
+    let blk: Arc<dyn Block + Send + Sync> = match opt.backend {
+        Backend::File { file } => {
+            let mut open_opt = OpenOptions::new();
+            open_opt.read(true);
 
-    if !opt.readonly {
-        open_opt.write(true);
-    }
+            if !opt.readonly {
+                open_opt.write(true);
+            }
 
-    let file = open_opt.open(opt.file)?;
-    let blk = Arc::new(io::block::File::new(file)?);
+            let file = open_opt.open(file)?;
+            Arc::new(io::block::File::new(file)?)
+        }
+        Backend::Memory { size } => Arc::new(block::memory::Memory::new(size * 1024 * 1024)),
+    };
 
     let size = blk.len();
     log::info!("Size of disk {size}");

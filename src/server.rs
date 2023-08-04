@@ -177,7 +177,7 @@ async fn option_reply_error<TX: AsyncWrite>(
     }
 }
 
-pub(crate) async fn handshake<RX: AsyncRead, TX: AsyncWrite, B: Block>(
+pub(crate) async fn handshake<RX: AsyncRead, TX: AsyncWrite, B: ?Sized + Block>(
     mut rx: Pin<&mut RX>,
     mut tx: Pin<&mut TX>,
     property: &Property,
@@ -388,7 +388,7 @@ pub async fn transmission<RX, TX, B>(
 where
     RX: AsyncRead,
     TX: AsyncWrite,
-    B: Block + Send + Sync + 'static,
+    B: ?Sized + Block + Send + Sync + 'static,
 {
     let (sender, recv) = tokio::sync::mpsc::unbounded_channel();
     tokio::try_join! {
@@ -428,7 +428,7 @@ pub async fn transmission_request<RX: AsyncRead, B>(
     block: Arc<B>,
 ) -> Result<()>
 where
-    B: Block + Send + Sync + 'static,
+    B: ?Sized + Block + Send + Sync + 'static,
 {
     loop {
         // Get a reference to the block device to be passed into sync code.
