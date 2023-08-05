@@ -42,6 +42,20 @@ enum Backend {
         #[arg(long)]
         size: usize,
     },
+    #[cfg(feature = "rocksdb")]
+    RocksDB {
+        /// Path to the RocksDB database.
+        #[arg(long)]
+        path: PathBuf,
+
+        /// Size of the block device (in MiB).
+        #[arg(long)]
+        size: u64,
+
+        /// Populate the database with random data.
+        #[arg(long)]
+        prepopulate: bool,
+    },
 }
 
 struct Property {
@@ -80,6 +94,26 @@ async fn main() -> Result<()> {
             Arc::new(io::block::File::new(file)?)
         }
         Backend::Memory { size } => Arc::new(block::memory::Memory::new(size * 1024 * 1024)),
+        #[cfg(feature = "rocksdb")]
+        Backend::RocksDB {
+            path,
+            size,
+            prepopulate,
+        } => {
+            use rand::Rng;
+
+            let blk = Arc::new(block::rocksdb::RocksBlock::new(&path, size * 1024 * 1024)?);
+
+            if prepopulate {
+                let mut data = [0; 4096];
+                for i in (0..size * 1024 * 1024).step_by(4096) {
+                    rand::thread_rng().fill(&mut data);
+                    blk.write_zero_at(i, 4096)?;
+                }
+            }
+
+            blk
+        }
     };
 
     let size = blk.len();
