@@ -14,6 +14,9 @@ io = { git = "https://github.com/nbdd0121/r2vm.git", default-features = false, f
 rocksdb = { version = "0.21", default-features = false, optional = true }
 rand = { version = "0.8", optional = true }
 
+[profile.release]
+debug = true
+
 [features]
-default = ["rocksdb"]
+default = []
 rocksdb = ["dep:rocksdb", "dep:rand"]
