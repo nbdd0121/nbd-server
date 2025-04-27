@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
             if prepopulate {
                 let mut data = [0; 4096];
                 for i in (0..size * 1024 * 1024).step_by(4096) {
-                    rand::thread_rng().fill(&mut data);
+                    rand::rng().fill(&mut data);
                     blk.write_zero_at(i, 4096)?;
                 }
             }
