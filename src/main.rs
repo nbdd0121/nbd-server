@@ -1,4 +1,5 @@
 mod block;
+mod proto;
 mod server;
 
 use anyhow::Result;

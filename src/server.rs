@@ -10,172 +10,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-pub const NBD_REP_ACK: u32 = 1;
-pub const NBD_REP_SERVER: u32 = 2;
-pub const NBD_REP_INFO: u32 = 3;
-
-pub const NBD_INFO_EXPORT: u16 = 0;
-pub const NBD_INFO_NAME: u16 = 1;
-pub const NBD_INFO_DESCRIPTION: u16 = 2;
-pub const NBD_INFO_BLOCK_SIZE: u16 = 3;
-
-const NBD_IHAVEOPT: u64 = 0x49484156454F5054;
-const NBG_REPLY_MAGIC: u64 = 0x3E889045565A9;
-const NBD_REQUEST_MAGIC: u32 = 0x25609513;
-const NBD_SIMPLE_REPLY_MAGIC: u32 = 0x67446698;
-
-bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug)]
-    struct HandshakeFlags: u16 {
-        const FIXED_NEWSTYLE = 1;
-        const NO_ZEROES = 2;
-    }
-}
-
-bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug)]
-    struct ClientFlags: u32 {
-        const FIXED_NEWSTYLE = 1;
-        const NO_ZEROES = 2;
-    }
-}
-
-bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug)]
-    struct TransmissionFlags: u16 {
-        const HAS_FLAGS = 1;
-        const READ_ONLY = 2;
-        const SEND_FLUSH = 4;
-        const SEND_FUA = 8;
-        const ROTATIONAL = 16;
-        const SEND_TRIM = 32;
-        const SEND_WRITE_ZEROES = 64;
-        const SEND_DF = 128;
-        const CAN_MULTI_CONN = 256;
-        const SEND_RESIZE = 512;
-        const SEND_CACHE = 1024;
-        const SEND_FAST_ZERO = 2048;
-        const BLOCK_STATUS_PAYLOAD = 4096;
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Options(pub u32);
-
-#[allow(non_upper_case_globals)]
-impl Options {
-    pub const ExportName: Self = Self(1);
-    pub const Abort: Self = Self(2);
-    pub const List: Self = Self(3);
-    pub const Starttls: Self = Self(5);
-    pub const Info: Self = Self(6);
-    pub const Go: Self = Self(7);
-    pub const StructuredReply: Self = Self(8);
-    pub const ListMetaContext: Self = Self(9);
-    pub const SetMetaContext: Self = Self(10);
-    pub const ExtendedHeaders: Self = Self(11);
-}
-
-#[derive(Debug)]
-struct OptionError(pub u32);
-
-#[allow(non_upper_case_globals)]
-impl OptionError {
-    pub const Unsup: Self = Self(1);
-    pub const Policy: Self = Self(2);
-    pub const Invalid: Self = Self(3);
-    pub const Platform: Self = Self(4);
-    pub const TlsReqd: Self = Self(5);
-    pub const Unknown: Self = Self(6);
-    pub const BlockSizeReqd: Self = Self(8);
-}
-
-bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug)]
-    struct CommandFlags: u16 {}
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Command(pub u16);
-
-#[allow(non_upper_case_globals)]
-impl Command {
-    pub const Read: Self = Self(0);
-    pub const Write: Self = Self(1);
-    pub const Disc: Self = Self(2);
-    pub const Flush: Self = Self(3);
-    pub const Trim: Self = Self(4);
-    pub const Cache: Self = Self(5);
-    pub const WriteZeroes: Self = Self(6);
-    pub const Resize: Self = Self(8);
-}
-
-impl std::fmt::Debug for Command {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Command::Read => write!(f, "Read"),
-            Command::Write => write!(f, "Write"),
-            Command::Disc => write!(f, "Disc"),
-            Command::Flush => write!(f, "Flush"),
-            Command::Trim => write!(f, "Trim"),
-            Command::Cache => write!(f, "Cache"),
-            Command::WriteZeroes => write!(f, "WriteZeroes"),
-            Command::Resize => write!(f, "Resize"),
-            _ => write!(f, "Command({:#x})", self.0),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct CommandError(pub NonZeroU32);
-
-#[allow(non_upper_case_globals)]
-impl CommandError {
-    pub const Perm: Self = Self(NonZeroU32::new(1).unwrap());
-    pub const Io: Self = Self(NonZeroU32::new(5).unwrap());
-    pub const Nomem: Self = Self(NonZeroU32::new(12).unwrap());
-    pub const Inval: Self = Self(NonZeroU32::new(22).unwrap());
-    pub const Nospc: Self = Self(NonZeroU32::new(28).unwrap());
-    pub const Overflow: Self = Self(NonZeroU32::new(75).unwrap());
-    pub const Notsup: Self = Self(NonZeroU32::new(95).unwrap());
-    pub const Shutdown: Self = Self(NonZeroU32::new(108).unwrap());
-}
-
-async fn option_reply<TX: AsyncWrite>(
-    mut tx: Pin<&mut TX>,
-    option: Options,
-    ty: u32,
-    data: &[u8],
-) -> Result<()> {
-    tx.write_u64(NBG_REPLY_MAGIC).await?;
-    tx.write_u32(option.0).await?;
-    tx.write_u32(ty).await?;
-    tx.write_u32(data.len() as u32).await?;
-    tx.write_all(data).await?;
-    tx.flush().await?;
-    Ok(())
-}
-
-async fn option_reply_error<TX: AsyncWrite>(
-    tx: Pin<&mut TX>,
-    option: Options,
-    error: OptionError,
-    message: std::fmt::Arguments<'_>,
-) -> Result<()> {
-    log::warn!("{}", message);
-    match message.as_str() {
-        Some(v) => option_reply(tx, option, error.0 | (1 << 31), v.as_bytes()).await,
-        None => {
-            option_reply(
-                tx,
-                option,
-                error.0 | (1 << 31),
-                message.to_string().as_bytes(),
-            )
-            .await
-        }
-    }
-}
+use crate::proto::*;
 
 pub(crate) async fn handshake<RX: AsyncRead, TX: AsyncWrite, B: ?Sized + Block>(
     mut rx: Pin<&mut RX>,
@@ -220,22 +55,26 @@ pub(crate) async fn handshake<RX: AsyncRead, TX: AsyncWrite, B: ?Sized + Block>(
         match option {
             Options::ExportName => {
                 let Ok(name) = std::str::from_utf8(buffer) else {
-                    option_reply_error(
+                    option_reply(
                         tx.as_mut(),
                         option,
-                        OptionError::Invalid,
-                        format_args!("export name must be UTF-8"),
+                        OptionReply::Err {
+                            code: OptionError::Invalid,
+                            message: "export name must be UTF-8",
+                        },
                     )
                     .await?;
                     continue;
                 };
 
                 if name != "rust" && !name.is_empty() {
-                    option_reply_error(
+                    option_reply(
                         tx.as_mut(),
                         option,
-                        OptionError::Invalid,
-                        format_args!("export name does not exist"),
+                        OptionReply::Err {
+                            code: OptionError::Invalid,
+                            message: "export name does not exist",
+                        },
                     )
                     .await?;
                     continue;
@@ -263,69 +102,81 @@ pub(crate) async fn handshake<RX: AsyncRead, TX: AsyncWrite, B: ?Sized + Block>(
                 return Ok(());
             }
             Options::Abort => {
-                option_reply(tx.as_mut(), option, NBD_REP_ACK, &[]).await?;
+                option_reply(tx.as_mut(), option, OptionReply::Ack).await?;
                 bail!("Client aborted connection");
             }
             Options::List => {
                 if length != 0 {
                     log::warn!("LIST comes with data");
-                    option_reply_error(
+                    option_reply(
                         tx.as_mut(),
                         option,
-                        OptionError::Invalid,
-                        format_args!("LIST comes with data"),
+                        OptionReply::Err {
+                            code: OptionError::Invalid,
+                            message: "LIST comes with data",
+                        },
                     )
                     .await?;
                     continue;
                 }
 
-                option_reply(tx.as_mut(), option, NBD_REP_SERVER, b"\x00\x00\x00\x04rust").await?;
-                option_reply(tx.as_mut(), option, NBD_REP_ACK, &[]).await?;
+                option_reply(tx.as_mut(), option, OptionReply::Server { name: "rust" }).await?;
+                option_reply(tx.as_mut(), option, OptionReply::Ack).await?;
             }
             Options::Starttls => {
-                option_reply_error(
+                option_reply(
                     tx.as_mut(),
                     option,
-                    OptionError::Unsup,
-                    format_args!("STARTTLS not supported"),
+                    OptionReply::Err {
+                        code: OptionError::Unsup,
+                        message: "STARTTLS not supported",
+                    },
                 )
                 .await?;
             }
             Options::Info => {
                 // TODO!
-                option_reply_error(
+                option_reply(
                     tx.as_mut(),
                     option,
-                    OptionError::Unsup,
-                    format_args!("INFO not supported"),
+                    OptionReply::Err {
+                        code: OptionError::Unsup,
+                        message: "INFO not supported",
+                    },
                 )
                 .await?;
             }
             Options::Go => {
                 // TODO!
-                option_reply_error(
+                option_reply(
                     tx.as_mut(),
                     option,
-                    OptionError::Unsup,
-                    format_args!("GO not supported"),
+                    OptionReply::Err {
+                        code: OptionError::Unsup,
+                        message: "GO not supported",
+                    },
                 )
                 .await?;
             }
             Options::StructuredReply => {
-                option_reply_error(
+                option_reply(
                     tx.as_mut(),
                     option,
-                    OptionError::Unsup,
-                    format_args!("STRUCTURED_REPLY not supported"),
+                    OptionReply::Err {
+                        code: OptionError::Unsup,
+                        message: "STRUCTURED_REPLY not supported",
+                    },
                 )
                 .await?;
             }
             _ => {
-                option_reply_error(
+                option_reply(
                     tx.as_mut(),
                     option,
-                    OptionError::Unsup,
-                    format_args!("unrecognized option type {:x?}", option),
+                    OptionReply::Err {
+                        code: OptionError::Unsup,
+                        message: &format!("unrecognized option type {:x?}", option),
+                    },
                 )
                 .await?;
             }
@@ -370,6 +221,7 @@ async fn command_reply_error<TX: AsyncWrite>(
             ErrorKind::PermissionDenied => CommandError::Perm,
             ErrorKind::OutOfMemory => CommandError::Nomem,
             ErrorKind::InvalidInput => CommandError::Inval,
+            ErrorKind::StorageFull => CommandError::Nospc,
             ErrorKind::Unsupported => CommandError::Notsup,
             _ => CommandError::Io,
         });
