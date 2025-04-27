@@ -131,14 +131,14 @@ struct CommandError(pub NonZeroU32);
 
 #[allow(non_upper_case_globals)]
 impl CommandError {
-    pub const Perm: Self = Self(unsafe { NonZeroU32::new_unchecked(1) });
-    pub const Io: Self = Self(unsafe { NonZeroU32::new_unchecked(5) });
-    pub const Nomem: Self = Self(unsafe { NonZeroU32::new_unchecked(12) });
-    pub const Inval: Self = Self(unsafe { NonZeroU32::new_unchecked(22) });
-    pub const Nospc: Self = Self(unsafe { NonZeroU32::new_unchecked(28) });
-    pub const Overflow: Self = Self(unsafe { NonZeroU32::new_unchecked(75) });
-    pub const Notsup: Self = Self(unsafe { NonZeroU32::new_unchecked(95) });
-    pub const Shutdown: Self = Self(unsafe { NonZeroU32::new_unchecked(108) });
+    pub const Perm: Self = Self(NonZeroU32::new(1).unwrap());
+    pub const Io: Self = Self(NonZeroU32::new(5).unwrap());
+    pub const Nomem: Self = Self(NonZeroU32::new(12).unwrap());
+    pub const Inval: Self = Self(NonZeroU32::new(22).unwrap());
+    pub const Nospc: Self = Self(NonZeroU32::new(28).unwrap());
+    pub const Overflow: Self = Self(NonZeroU32::new(75).unwrap());
+    pub const Notsup: Self = Self(NonZeroU32::new(95).unwrap());
+    pub const Shutdown: Self = Self(NonZeroU32::new(108).unwrap());
 }
 
 async fn option_reply<TX: AsyncWrite>(
@@ -358,10 +358,10 @@ async fn command_reply_error<TX: AsyncWrite>(
     let mut code = Ok(());
 
     // Pass the error code through, but only for Linux.
-    #[cfg(linux)]
+    #[cfg(target_os = "linux")]
     if let Some(e) = error.raw_os_error() {
         if e != 0 {
-            code = Err(e as u32);
+            code = Err(CommandError(NonZeroU32::new(e as u32).unwrap()));
         }
     }
 
