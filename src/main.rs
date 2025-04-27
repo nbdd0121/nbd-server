@@ -76,9 +76,25 @@ where
     Ok(())
 }
 
+fn tracing_init() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .from_env_lossy();
+    let layer = tracing_tree::HierarchicalLayer::default()
+        .with_indent_lines(true)
+        .with_ansi(true)
+        .with_targets(true)
+        .with_indent_amount(2);
+    let subscriber = tracing_subscriber::Registry::default()
+        .with(filter)
+        .with(layer);
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    tracing_init();
 
     let opt = Opt::parse();
 
@@ -118,15 +134,15 @@ async fn main() -> Result<()> {
     };
 
     let size = blk.len();
-    log::info!("Size of disk {size}");
+    tracing::info!("Size of disk {size}");
 
     let listener = TcpListener::bind((&*opt.addr, opt.port)).await?;
 
-    log::info!("Listening on {}:{}", opt.addr, opt.port);
+    tracing::info!("Listening on {}:{}", opt.addr, opt.port);
 
     loop {
         let (stream, addr) = listener.accept().await?;
-        log::info!("Connection accepted from {addr}");
+        tracing::info!("Connection accepted from {addr}");
 
         match handle_client(
             stream,
@@ -139,10 +155,10 @@ async fn main() -> Result<()> {
         .await
         {
             Ok(_) => {
-                log::info!("client {addr} exited");
+                tracing::info!("client {addr} exited");
             }
             Err(e) => {
-                log::error!("error handling client {addr}: {e}");
+                tracing::error!("error handling client {addr}: {e}");
             }
         }
     }

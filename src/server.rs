@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use super::Property;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use io::block::Block;
 use std::io::{Error, ErrorKind};
 use std::num::NonZeroU32;
@@ -107,7 +107,7 @@ pub(crate) async fn handshake<RX: AsyncRead, TX: AsyncWrite, B: ?Sized + Block>(
             }
             Options::List => {
                 if length != 0 {
-                    log::warn!("LIST comes with data");
+                    tracing::warn!("LIST comes with data");
                     option_reply(
                         tx.as_mut(),
                         option,
@@ -204,7 +204,7 @@ async fn command_reply_error<TX: AsyncWrite>(
     error: Error,
     handle: u64,
 ) -> Result<()> {
-    log::error!("error processing command: {error}");
+    tracing::error!("error processing command: {error}");
 
     let mut code = Ok(());
 
@@ -298,7 +298,7 @@ where
         let offset = rx.read_u64().await?;
         let length = rx.read_u32().await? as usize;
 
-        log::trace!("ty={ty:?}, cookie={cookie:x}, offset={offset:#x}, length={length:#x}");
+        tracing::trace!("ty={ty:?}, cookie={cookie:x}, offset={offset:#x}, length={length:#x}");
 
         match ty {
             Command::Read => {

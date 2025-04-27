@@ -1,6 +1,6 @@
 use anyhow::Result;
 use io::block::{Block, Capability};
-use rocksdb::{DBCompressionType, Options, DB};
+use rocksdb::{DB, DBCompressionType, Options};
 use std::path::Path;
 
 pub struct RocksBlock {
